@@ -1,0 +1,638 @@
+================================================================================
+PINGBOARD — PROJECT HANDOVER
+Multi-tenant uptime monitoring with public status pages
+Built 2026-09-29 to 2026-10-05 · Phases 0-7 complete, Phase 8 not started
+================================================================================
+
+If you only read one section, read "HOW TO RUN IT" and "GOTCHAS". Everything
+else is context.
+
+
+--------------------------------------------------------------------------------
+1. WHAT IT IS
+--------------------------------------------------------------------------------
+
+An organisation signs up, registers monitors (a URL + check interval + a set of
+assertions), and a background worker checks them on schedule. Failures open
+incidents automatically and notify the team over Slack / Discord / email. Each
+org can publish a public status page that anyone can view without logging in.
+
+Think a small, self-hostable UptimeRobot / Better Uptime.
+
+Stack:
+  Backend    FastAPI (fully async), SQLAlchemy 2.1, Alembic, Pydantic v2
+  Worker     ARQ (Redis-backed, async-native)
+  Database   PostgreSQL 16
+  Cache/Queue Redis 7
+  Frontend   React 19 + TypeScript + Vite 7 + Tailwind v4 + TanStack Query
+  Charts     Recharts
+  Infra      Docker Compose (5 services)
+
+Size: ~5,700 lines backend app, ~4,300 lines frontend, ~1,000 lines tests.
+41 API operations across 32 paths. 6 migrations. 215 tests.
+
+
+--------------------------------------------------------------------------------
+2. HOW TO RUN IT
+--------------------------------------------------------------------------------
+
+You need Docker with the Compose plugin. Nothing else — no local Python or Node.
+
+    cp .env.example .env
+    # Edit .env and set a real JWT_SECRET:
+    #   openssl rand -hex 32
+    # Also set DOCKER_UID / DOCKER_GID to your own (run: id -u  and  id -g)
+
+    docker compose up --build
+
+Then:
+    Frontend        http://localhost:5173
+    API             http://localhost:8000
+    API docs        http://localhost:8000/docs      (Swagger, auto-generated)
+    Liveness        http://localhost:8000/health
+    Readiness       http://localhost:8000/health/ready   (pings DB + Redis)
+
+Postgres is published on host port 5433 and Redis on 6380 — deliberately NOT
+the standard 5432/6379, so the stack does not collide with a Postgres or Redis
+you already have installed. Containers always reach each other on db:5432 and
+redis:6379 regardless. Override POSTGRES_PORT / REDIS_PORT in .env if those are
+taken too.
+
+Migrations run automatically when the api container starts. To drive Alembic by
+hand:
+
+    docker compose exec api alembic upgrade head
+    docker compose exec api alembic downgrade -1
+    docker compose exec api alembic revision --autogenerate -m "message"
+    docker compose exec api alembic check        # detects model/schema drift
+
+Running the checks:
+
+    docker compose exec api ruff check .
+    docker compose exec api ruff format --check .
+    docker compose exec api mypy app             # strict mode
+    docker compose exec api pytest
+
+    docker compose exec web npm run lint
+    docker compose exec web npm run typecheck
+    docker compose exec web npm run build
+
+
+--------------------------------------------------------------------------------
+3. THE FIVE SERVICES
+--------------------------------------------------------------------------------
+
+  db        postgres:16-alpine
+  redis     redis:7-alpine          (job queue + cache + rate-limit counters)
+  api       FastAPI via uvicorn     (serves HTTP, never makes outbound checks)
+  worker    same image as api,      (makes outbound checks, never serves HTTP)
+            different command: arq app.workers.main.WorkerSettings
+  web       Vite dev server         (production target builds static + nginx)
+
+api and worker share one image and one codebase but are separate processes.
+That split is deliberate: a slow outbound HTTP check must never be able to
+block an API request, and vice versa.
+
+
+--------------------------------------------------------------------------------
+4. HOW THE INTERESTING PARTS WORK
+--------------------------------------------------------------------------------
+
+### Authentication — split-token scheme
+
+                    Access token          Refresh token
+  Form              Signed JWT (HS256)    Opaque 64-byte random string
+  Lifetime          15 minutes            30 days
+  Lives in          Client MEMORY only    httpOnly SameSite=Lax cookie, /auth
+  Server-side       Nothing stored        SHA-256 digest row, revocable
+
+The access token is deliberately kept OUT of localStorage: anything JavaScript
+can read, injected script can read too. Because it lives only in memory, a page
+reload starts with no token — the SPA silently calls POST /auth/refresh, which
+the browser answers from a cookie the page itself cannot read.
+
+Refresh tokens are SINGLE-USE. Every refresh revokes the presented token and
+issues a new one. Presenting an already-rotated token is treated as theft: all
+of that user's sessions are revoked and a warning is logged.
+
+Passwords are bcrypt-hashed after a SHA-256 pre-hash. The pre-hash sidesteps
+bcrypt's 72-byte truncation so a long passphrase keeps its full entropy.
+
+GitHub OAuth is wired (authorization-code flow, state stored in Redis and burned
+on use). The callback sets the refresh cookie and redirects to the SPA, so no
+token ever appears in a URL. Leave GITHUB_CLIENT_ID/SECRET unset and those two
+endpoints return 503; nothing else is affected.
+
+### Roles
+
+Everything hangs off an organisation. Access is decided by the caller's
+membership row, NEVER by an org_id supplied in the request (that is only ever a
+lookup key).
+
+  viewer   read the org and its members
+  admin    ...plus create/edit monitors, invite members, manage channels
+  owner    ...plus everything, including granting owner and revoking API keys
+
+Non-members get 404, not 403 — telling an outsider that an organisation exists
+is itself a disclosure.
+
+### The scheduler (worker)
+
+Every 10 seconds the worker claims monitors whose next_run_at has passed and
+enqueues one check job each. Two details make this safe with more than one
+worker running:
+
+  - The claim uses SELECT ... FOR UPDATE SKIP LOCKED, so each due monitor goes
+    to exactly one worker and contention never blocks.
+  - next_run_at advances AS PART OF THE CLAIM, before the check runs. A worker
+    that dies mid-check costs one missed data point rather than re-claiming the
+    same monitor in a tight loop against someone else's server.
+
+After an outage the scheduler catches up in a single hop rather than firing
+every missed slot. A 30-second monitor unchecked for an hour runs once, not 120
+times.
+
+### Flap protection
+
+A monitor flips to "down" only after 3 consecutive failures, so one blip does
+not raise an alarm. Recovery is immediate — the first success restores "up" and
+resets the counter. Both transitions are edge-triggered, which is what lets
+incidents open and resolve exactly once.
+
+### SSRF guard — the security-critical bit
+
+A monitor is, by design, a server-side fetch of a URL the user chose. Without a
+guard that is a textbook SSRF primitive: the worker sits inside your private
+network and would happily fetch the cloud metadata service or an internal admin
+panel on the attacker's behalf.
+
+The guard is RESOLVE-THEN-INSPECT, not pattern matching. A hostname like
+"metadata.evil.example" can resolve to 169.254.169.254, so validating the string
+alone proves nothing. Every address the hostname resolves to must be public.
+
+Rejected: loopback (all of 127/8), RFC1918 private ranges, link-local and cloud
+metadata (169.254/16), carrier-grade NAT, TEST-NET ranges, multicast, reserved,
+unspecified, IPv4-mapped IPv6 (::ffff:127.0.0.1), non-http(s) schemes, and
+credentials embedded in the URL.
+
+It runs THREE times: on create, on update, and again inside the worker just
+before each request. The third is the important one — DNS can change between
+saving a monitor and checking it, and re-resolving at execution time is what
+closes the rebinding hole.
+
+58 unit tests cover it (tests/test_ssrf.py).
+
+### Incidents and alerting
+
+When a monitor crosses the failure threshold the worker opens an Incident; when
+it recovers, the same edge closes it and appends an automatic "resolved" entry.
+
+A partial unique index (monitor_id WHERE resolved_at IS NULL) means the DATABASE
+guarantees at most one open incident per monitor — two workers racing cannot
+produce duplicates.
+
+Notifications are QUEUED, never inline. The checker enqueues a job and moves on;
+a webhook that hangs for 30 seconds cannot slow down monitoring. Delivery fans
+out to every active channel, and one broken channel does not stop the others.
+
+The one exception is POST /channels/{id}/test, which delivers synchronously
+because someone configuring a webhook needs immediate feedback.
+
+Webhook URLs are bearer credentials — anyone holding one can post into that
+workspace. They are stored as given but MASKED on every read, so GET /channels
+returns "https://hooks.slack.com/..." and never the secret path.
+
+### Public status pages
+
+GET /public/status/{slug} takes no auth dependency and returns a schema written
+for that endpoint alone — never the internal MonitorRead. A visitor sees a
+display name, a traffic light and a 90-day bar. The target URL, every UUID, the
+assertions and the check interval all stay private. A new monitor field is
+private by default rather than exposed by accident.
+
+On the frontend the route sits OUTSIDE AuthLayout, so an anonymous visitor
+triggers no session bootstrap and no call to /auth/refresh at all.
+
+A missing slug and an unpublished page return the same 404, so the endpoint
+cannot be used to discover private slugs. Monitors added to a page are filtered
+through the owning org, so a guessed id from another tenant is silently dropped.
+
+Uptime is aggregated in SQL (generate_series left-joined to a grouped count),
+not by pulling rows into Python: a 90-day window on a 30-second monitor is
+~250,000 rows to produce 90 numbers. Days with no checks render as explicit
+gaps rather than disappearing — a monitoring outage must never masquerade as
+uptime.
+
+### Rollups and retention
+
+A worker job aggregates each closed hour of check_results into one
+rollups_hourly row per monitor, upserted on (monitor_id, hour) so a re-run after
+a crash recomputes rather than double-counting.
+
+GET /monitors/{id}/uptime reads those rollups plus the still-open hour. Measured
+on 43,000 raw rows over 30 days, this cut shared buffer reads from 841 to 15.
+
+A daily job prunes raw checks older than RAW_RETENTION_DAYS (default 30), in
+batches, and only rows already covered by a rollup — so pruning can never
+destroy history that was not summarised first.
+
+### Caching and rate limiting
+
+Public status pages (30s TTL) and uptime figures (60s TTL) are cached in Redis.
+TTL-only, no invalidation: these are continuously changing aggregates where a
+short staleness window is invisible. Responses carry X-Cache: HIT|MISS.
+
+A Redis outage degrades to "slower", never "broken" — every path falls back to
+computing the value.
+
+Three separate rate-limit budgets, all Redis fixed-window by client IP:
+  auth endpoints     10/min   (tightest — these are worth brute-forcing)
+  public status      60/min
+  authenticated writes 120/min
+
+A Redis failure fails OPEN on purpose: losing a rate limiter must not lock users
+out of signing in.
+
+### API keys
+
+pb_-prefixed (greppable in logs, detectable by secret scanners), shown exactly
+once at creation, stored only as a SHA-256 digest. A key authenticates as an
+admin of ONE organisation and is refused against any other, so POST /monitors is
+scriptable from CI with no browser session:
+
+    curl -X POST "http://localhost:8000/monitors?org_id=<ORG>" \
+      -H "X-API-Key: pb_..." \
+      -H "Content-Type: application/json" \
+      -d '{"name":"From CI","url":"https://example.com"}'
+
+Revoking is a soft delete, so the audit trail outlives the credential.
+
+### Frontend
+
+One token system. Every colour is a ROLE — surface / ink / line, plus the
+reserved status colours up / down / degraded / unknown — defined once in
+index.css. Dark mode is a second set of values for those same roles under
+[data-theme="dark"], not a second set of components. The latency chart follows
+it through var() in SVG fills.
+
+Status is ALWAYS word + shape, never colour alone, so it survives
+colour-blindness and forced-colours mode.
+
+src/api/schema.d.ts is GENERATED from the live OpenAPI document:
+
+    docker compose exec web npx openapi-typescript http://api:8000/openapi.json \
+      -o src/api/schema.d.ts
+
+types.ts aliases those generated schemas rather than restating them, so a
+backend field that changes shape fails tsc instead of breaking at runtime.
+Wiring this up immediately caught two fields the hand-written types had wrongly
+assumed were always present.
+
+
+--------------------------------------------------------------------------------
+5. DATABASE SCHEMA (15 tables)
+--------------------------------------------------------------------------------
+
+  users                  id, email UNIQUE, password_hash NULL, github_id NULL,
+                         name, created_at
+  refresh_tokens         id, user_id FK, token_hash UNIQUE, expires_at,
+                         revoked_at NULL, created_at
+  organizations          id, name, slug UNIQUE, created_at
+  memberships            id, org_id FK, user_id FK, role, UNIQUE(org_id,user_id)
+  org_invites            id, org_id FK, email, role, token_hash UNIQUE,
+                         expires_at, accepted_at NULL, invited_by FK
+
+  monitors               id, org_id FK, name, url, method, interval_s,
+                         timeout_ms, assertions JSONB, is_active, status,
+                         consecutive_failures, last_checked_at, next_run_at
+  check_results          id, monitor_id FK, checked_at, ok, status_code NULL,
+                         latency_ms NULL, error NULL
+  rollups_hourly         monitor_id FK, hour, checks, failures, p95_ms
+                         PRIMARY KEY(monitor_id, hour)
+
+  incidents              id, monitor_id FK, started_at, resolved_at NULL,
+                         severity, cause, created_at
+  incident_updates       id, incident_id FK, message, created_by FK NULL,
+                         is_auto, created_at
+  notification_channels  id, org_id FK, name, type, config JSONB, is_active
+
+  status_pages           id, org_id FK, slug UNIQUE, title, description,
+                         is_published, created_at
+  status_page_monitors   status_page_id FK, monitor_id FK (composite PK)
+
+  api_keys               id, org_id FK, name, key_hash UNIQUE, last_used_at,
+                         revoked_at NULL, created_at
+
+  alembic_version        (Alembic bookkeeping)
+
+Indexes worth knowing about:
+  ix_monitors_due                     PARTIAL: (next_run_at) WHERE is_active
+                                      — the scheduler's hot query; paused
+                                      monitors cost nothing to skip
+  ix_check_results_monitor_checked    (monitor_id, checked_at DESC) — history is
+                                      always read newest-first, so no sort
+  uq_incidents_one_open_per_monitor   PARTIAL UNIQUE: (monitor_id)
+                                      WHERE resolved_at IS NULL
+
+
+--------------------------------------------------------------------------------
+6. API SURFACE
+--------------------------------------------------------------------------------
+
+Auth
+  POST    /auth/register
+  POST    /auth/login
+  POST    /auth/refresh
+  POST    /auth/logout
+  GET     /auth/me
+  GET     /auth/github/login
+  GET     /auth/github/callback
+
+Orgs
+  POST    /orgs
+  GET     /orgs
+  GET     /orgs/{org_id}/members
+  POST    /orgs/{org_id}/invite
+  POST    /orgs/invites/{token}/accept
+  POST    /orgs/{org_id}/api-keys
+  GET     /orgs/{org_id}/api-keys
+  DELETE  /api-keys/{key_id}?org_id=
+
+Monitors            (org_id passed as a query parameter)
+  POST    /monitors                   accepts Bearer token OR X-API-Key
+  GET     /monitors
+  GET     /monitors/{id}
+  PATCH   /monitors/{id}
+  DELETE  /monitors/{id}
+  POST    /monitors/{id}/run-now
+  GET     /monitors/{id}/checks?from=&to=&limit=&cursor=
+  GET     /monitors/{id}/uptime?window=24h|7d|30d|90d
+  POST    /monitors/{id}/pause
+  POST    /monitors/{id}/resume
+
+Incidents
+  GET     /incidents?status=open|resolved&monitor_id=
+  GET     /incidents/{id}
+  POST    /incidents/{id}/updates
+  POST    /incidents/{id}/resolve
+
+Channels
+  GET     /channels
+  POST    /channels
+  PATCH   /channels/{id}
+  DELETE  /channels/{id}
+  POST    /channels/{id}/test
+
+Status pages
+  POST    /status-pages
+  GET     /status-pages
+  PATCH   /status-pages/{id}
+  DELETE  /status-pages/{id}
+  GET     /public/status/{slug}       *** NO AUTH ***
+
+Health
+  GET     /health
+  GET     /health/ready
+
+
+--------------------------------------------------------------------------------
+7. WHAT WAS BUILT, PHASE BY PHASE
+--------------------------------------------------------------------------------
+
+Built against PingBoard_Implementation_Plan.md (the file one directory up), which
+splits the work into 9 phases. Each phase has an acceptance test; each was
+verified before moving on, by driving the real app in a headless Chrome and with
+real HTTP calls.
+
+Phase 0  Scaffolding        docker compose up boots everything; browser renders
+                            {"status":"ok"} from the API
+Phase 1  Auth & orgs        Register -> invite -> accept; tampered JWT rejected
+                            with 401; Org A's token cannot read Org B
+Phase 2  Monitors & checker Create monitor + Run now; localhost,
+                            169.254.169.254 and ftp:// all rejected
+Phase 3  Scheduler & worker Checks accumulate untouched; worker stopped -> none
+                            appear; status flips down only at 3 failures
+Phase 4  Incidents & alerts Incident auto-opened at the threshold, webhook
+                            fired, auto-resolved on recovery
+Phase 5  Public status page Incognito context loads it with ZERO /auth/ calls
+                            and no UUIDs anywhere in the DOM
+Phase 6  Scale & safety     Rollups cut 841 buffer reads to 15; API key creates
+                            a monitor via curl, then revoked -> 401
+Phase 7  Polish & UX        Dashboard, dark mode, toasts, 390px with no
+                            horizontal overflow, generated typed client
+
+Phase 8 (testing, CI/CD, deployment) was deliberately NOT started.
+Phase 9 (stretch features) likewise.
+
+
+--------------------------------------------------------------------------------
+8. BUGS FOUND AND FIXED DURING THE BUILD
+--------------------------------------------------------------------------------
+
+The two worth knowing about, both real and both found by testing rather than by
+reading:
+
+(a) CONCURRENT REFRESH REVOKED EVERY SESSION.
+    AuthProvider's mount effect called /auth/refresh directly, bypassing the
+    single-flight dedupe that only covered 401-triggered refreshes. React
+    StrictMode double-invokes that effect, so two concurrent refreshes fired;
+    the second looked like token reuse and triggered mass revocation. This would
+    also have hit two browser tabs opening at the same time in production.
+    Fixed by routing EVERY refresh through one shared promise. Verified with
+    three simultaneous tab loads and zero reuse events.
+
+(b) PUBLIC STATUS PAGE HUNG ON "Loading...".
+    A failed auth bootstrap called queryClient.clear(), which aborted the page's
+    own in-flight request. Fixed by only clearing when a session actually ended,
+    and by moving the public route outside AuthProvider entirely.
+
+Also fixed along the way:
+  - Postgres enum types orphaned on downgrade (affected 3 migrations). An
+    implicit CREATE TYPE from a column definition is never paired with a
+    DROP TYPE, so downgrade-then-upgrade failed. All enums are now created and
+    dropped explicitly.
+  - Annotated[..., dependency] without Depends() silently became a query
+    parameter, making POST /incidents/{id}/updates return 422 always.
+  - Slug truncation left a trailing hyphen (caught by a test written for it).
+  - date_trunc overload ambiguity with asyncpg — bind parameters arrive untyped,
+    so the cast has to be explicit.
+  - User.memberships was eager-loading on every authenticated request for a
+    relationship nothing read.
+
+
+--------------------------------------------------------------------------------
+9. GOTCHAS — READ THIS BEFORE YOU ARE CONFUSED
+--------------------------------------------------------------------------------
+
+* SELinux (Fedora/RHEL). Bind mounts need the :z label or the container gets
+  PermissionError reading its own source. docker-compose.yml already sets it. If
+  you add a mount, label it too.
+
+* File ownership. Both images take UID/GID build args. Set DOCKER_UID and
+  DOCKER_GID in .env to your own values (id -u, id -g) or files the containers
+  write will be owned by the wrong user.
+
+* The auth rate limiter WILL bite you while testing. 10 requests/minute per IP
+  on /auth/login and /auth/register. If a test script suddenly starts failing
+  after a few runs, that is almost certainly why. Wait 60 seconds.
+
+* p95 from rollups is APPROXIMATE. Counts recombine exactly (verified:
+  43,153 = 43,153). Percentiles do not — you cannot recover a true window p95
+  from per-hour p95s. The reported figure is the worst hour's p95, a deliberate
+  over-estimate (measured 212 true vs 216 reported) rather than a number that
+  looks exact and is quietly wrong. Query raw rows for a true p95 inside the
+  retention window.
+
+* Webhook URLs accept plain http:// when ENV != prod, so a local receiver works
+  in development. Production requires https://.
+
+* example.com occasionally resolves to a TEST-NET address (192.0.2.1) depending
+  on the resolver. The SSRF guard correctly blocks that. If monitor creation
+  against example.com suddenly 422s, check DNS before suspecting a bug.
+
+* The refresh cookie is scoped to Path=/auth and SameSite=Lax. If you deploy the
+  frontend and API to genuinely different sites (e.g. *.vercel.app calling
+  *.fly.dev) you must set COOKIE_SAMESITE=none and COOKIE_SECURE=true. Different
+  ports on one host are still same-site, so lax is correct locally.
+
+* Monitors are org-scoped via an org_id QUERY parameter, not a path segment.
+  That parameter is a lookup key only — authorisation always comes from the
+  caller's membership row.
+
+
+--------------------------------------------------------------------------------
+10. WHAT IS NOT DONE
+--------------------------------------------------------------------------------
+
+Phase 8 is entirely untouched. Specifically missing:
+
+  - DB integration tests. The 215 existing tests are unit-level: the SSRF guard,
+    the checker's assertion logic, the scheduler's next_run_at arithmetic, role
+    comparison, slugify, the notifier, rollup maths, API key hashing. There are
+    NO tests that exercise auth or monitor CRUD against a real database.
+  - Frontend tests. No Vitest, no React Testing Library, no Playwright. All
+    frontend verification so far was done by driving headless Chrome manually
+    during the build; those scripts were scratch files and are not in the repo.
+  - CI. No GitHub Actions workflow. The lint/type/test commands all exist and
+    pass, but nothing runs them automatically.
+  - Deployment. No docker-compose.prod.yml, no platform config, no secret
+    manager wiring. The frontend Dockerfile HAS a production target (static
+    build + nginx with SPA fallback and immutable asset caching) but it has
+    never been exercised.
+  - No live deployment, so no demo URL and no screenshots in the README.
+
+Phase 9 stretch ideas (SSL expiry checks, heartbeat monitors, multi-region
+checkers, AI postmortem drafts, Prometheus /metrics, maintenance windows) are
+listed in the plan and none are started.
+
+Other known gaps:
+  - Email is console-logged unless SMTP_HOST is set. No Mailhog in compose.
+  - No way to change a member's role or remove a member after they join.
+  - No password reset flow.
+  - Incident severity is always "major" — the column and enum exist, nothing
+    sets anything else.
+
+
+--------------------------------------------------------------------------------
+11. FILE MAP
+--------------------------------------------------------------------------------
+
+backend/app/
+  main.py                   app factory, CORS, router registration
+  health.py                 liveness + readiness
+  core/
+    config.py               pydantic-settings; every env var lives here
+    db.py                   async engine, session factory, get_db dependency
+    security.py             password hashing, JWT create/decode, opaque tokens
+    cache.py                Redis JSON caching (TTL-only, fails open)
+    ratelimit.py            three fixed-window limiters (auth/public/write)
+    mail.py                 SMTP, console-logs when unconfigured
+    redis.py                shared connection pool
+    logging.py              JSON logs outside dev
+    mixins.py               UUID PK + created_at column mixins
+    models_registry.py      single import surface so Alembic sees every model
+  auth/                     models, service, tokens (rotation + reuse
+                            detection), cookies, github OAuth, deps, router
+  orgs/                     org/membership/invite models, RBAC deps, scope
+                            (query-param org scoping), api_keys, api_key_deps
+                            (API-key-or-JWT principal), routers
+  monitors/
+    ssrf.py                 *** the SSRF guard — read this one ***
+    checker.py              pure async run_check(monitor, client)
+    models.py               Monitor + CheckResult
+    rollups.py              hourly aggregation SQL + retention pruning
+    service.py, deps.py, router.py, schemas.py
+  incidents/                incident lifecycle, timeline updates
+  channels/                 notifier protocol + Slack/Discord/email impls,
+                            config masking
+  status_pages/
+    queries.py              the 90-day generate_series uptime CTE
+    schemas.py              *** narrow PUBLIC schemas, separate on purpose ***
+    service.py, models.py, router.py
+  workers/
+    main.py                 ARQ WorkerSettings, cron definitions
+    runner.py               scheduler_tick (claim+enqueue) + run_monitor_check
+    schedule.py             pure next_run_after / apply_check_outcome maths
+    notify.py               notification fan-out job
+    maintenance.py          hourly rollup + daily prune jobs
+    queue.py                enqueueing from the API process
+
+backend/tests/              11 test modules, 215 tests, all unit-level
+
+frontend/src/
+  api/
+    client.ts               axios instance, silent refresh, single-flight
+    schema.d.ts             GENERATED from OpenAPI — do not hand-edit
+    types.ts                aliases the generated schemas
+    tokenStore.ts           in-memory access token (never localStorage)
+    auth|orgs|monitors|incidents|channels|statusPages|apiKeys.ts
+  features/
+    auth/                   AuthProvider, AuthLayout, useAuth
+    theme/useTheme.ts       light/dark with localStorage persistence
+    toast/                  ToastProvider + useToast
+  components/
+    ui.tsx                  the shared component set (token-based)
+    AppLayout, ProtectedRoute, ErrorBoundary, Skeleton, EmptyState
+    StatusPill, LatencyChart, UptimeBar, format.ts
+  pages/                    19 pages
+  index.css                 *** the design tokens + dark mode live here ***
+  routes.tsx                note: /status/:slug sits OUTSIDE AuthLayout
+
+backend/alembic/versions/   6 migrations, in order:
+  42f8bd43b9ae  auth and organizations
+  ef5ade420c6e  monitors and check results
+  eba9ef492eb4  monitor status and failure tracking
+  599599770f45  incidents and notification channels
+  02af51067fca  status pages
+  409a3399698d  rollups and api keys
+
+
+--------------------------------------------------------------------------------
+12. VERIFICATION STATUS AS OF HANDOVER
+--------------------------------------------------------------------------------
+
+Verified from a completely wiped cold start (docker compose down -v, then
+up --build):
+
+  [x] 15 tables built from 6 migrations on an empty database
+  [x] All 5 services healthy
+  [x] Worker scheduling and executing checks
+  [x] 215 tests passing
+  [x] ruff check / ruff format --check clean
+  [x] mypy --strict clean (66 source files)
+  [x] eslint clean
+  [x] tsc clean
+  [x] vite build succeeds
+  [x] pip-audit: no known vulnerabilities
+  [x] npm audit: 0 vulnerabilities
+  [x] alembic check: no model/schema drift
+  [x] Every migration round-trips (upgrade -> downgrade -> upgrade)
+
+Live smoke test on the fresh stack: register -> org -> SSRF guard rejects three
+vectors -> monitor goes "up" within 8s via the worker -> public status page
+readable with no auth and no leaked URL -> API key creates a monitor -> rate
+limiter returns 429 after 59 requests.
+
+================================================================================
+END
+================================================================================
