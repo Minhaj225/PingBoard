@@ -5,6 +5,8 @@ monitors (a URL, a check interval and a set of assertions), a background worker
 checks them on schedule, failures open incidents and notify the team over
 email/Slack/Discord, and each org can publish a no-login public status page.
 
+[![CI Pipeline](https://github.com/your-org/pingboard/workflows/CI/CD%20Pipeline/badge.svg?branch=main&event=push)](https://github.com/your-org/pingboard/actions?query=workflow%3A%22CI%2FCD+Pipeline%22)
+
 **Stack:** React + TypeScript + Tailwind · FastAPI (async) · PostgreSQL 16 · Redis 7 · ARQ · Docker · JWT/OAuth
 
 ## Architecture
@@ -285,6 +287,7 @@ docker compose exec api pytest
 # Frontend
 docker compose exec web npm run lint
 docker compose exec web npm run typecheck
+docker compose exec web npm run test
 docker compose exec web npm run build
 ```
 
@@ -304,4 +307,65 @@ pingboard/
 ├─ frontend/
 │  └─ src/{api,components,features,hooks,pages}
 └─ docker-compose.yml
+
+---
+
+## Production Setup
+
+For production deployments, use `docker-compose.prod.yml` which configures the stack
+for a proper production environment:
+
+```bash
+cp .env.example .env
+# Edit .env and set required values:
+#   DOCKER_UID / DOCKER_GID to match your host user
+#   JWT_SECRET with a strong random value
+#   POSTGRES_PORT / REDIS_PORT if default ports are taken
+#   WEB_PORT if 80 is already in use
+
+docker compose -f docker-compose.prod.yml up --build -d
+```
+
+The production compose file includes:
+
+| Service | Role |
+| ------- | ---- |
+| `db` | PostgreSQL 16 with data persistence |
+| `redis` | Redis 7 for cache, rate limits, and ARQ job queue |
+| `api` | FastAPI + Uvicorn in production mode |
+| `worker` | ARQ worker for scheduled checks |
+| `nginx` | Static frontend served via Nginx with API proxy |
+
+### Health checks
+
+All services define `restart: unless-stopped` and explicit health checks. The API
+and readiness endpoints are available at `http://localhost:8000/health` and
+`http://localhost:8000/health/ready` (liveness pings DB + Redis). Nginx serves
+the frontend on port 80 (or `${WEB_PORT:-80}`).
+
+### Deployment to cloud platforms
+
+| Platform | Steps |
+| -------- | ----- |
+| **Render** | 1. Connect your GitHub repo. 2. Create a new Web Service pointing at `docker-compose.prod.yml`. 3. Set environment variables from `.env`. 4. Render automatically builds and starts all services. |
+| **Fly.io** | 1. `fly launch` (accept `fly.toml` defaults). 2. Set `env` from `.env` in `fly.toml`. 3. `fly deploy` — Fly uses its own internal network, so services communicate via hostname. |
+| **Railway** | 1. New Project → Deploy from Git. 2. Add the `docker-compose.prod.yml` as the primary service file. 3. Set environment variables in the dashboard. |
+
+---
+
+## What I'd do differently at scale
+
+- **Distributed edge probes**: Deploy lightweight checkers in multiple regions so
+  latency and uptime are measured from the same geography as the users.
+- **ClickHouse for metric storage**: Replace PostgreSQL raw-check storage with
+  ClickHouse for massive cardinality and fast time-series queries on millions of
+  check results.
+- **Kafka event streaming**: Replace Redis-based notification fan-out with Kafka
+  topics for guaranteed delivery and backpressure handling at scale.
+- **Multi-region failover**: Deploy duplicate DB + Redis clusters in different
+  regions with automatic failover (e.g., Patroni + PgBouncer).
+- **Service mesh**: Add a service mesh (e.g., Traefik or Istio) for mTLS, canary
+  deployments, and observability across all microservices.
+- **SLA monitoring**: Track and report SLA percentages per organization with
+  customizable thresholds and alerting.
 ```

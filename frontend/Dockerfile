@@ -9,9 +9,9 @@ ARG GID=1000
 ENV HOME=/home/app
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+RUN npm ci --legacy-peer-deps --no-audit --no-fund || npm install --legacy-peer-deps --no-audit --no-fund
 COPY . .
-RUN mkdir -p "$HOME" && chown -R "$UID:$GID" /app "$HOME"
+RUN mkdir -p "$HOME" && chown "$UID:$GID" "$HOME"
 USER $UID:$GID
 EXPOSE 5173
 CMD ["npm", "run", "dev"]
@@ -20,7 +20,7 @@ CMD ["npm", "run", "dev"]
 FROM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+RUN npm ci --legacy-peer-deps --no-audit --no-fund || npm install --legacy-peer-deps --no-audit --no-fund
 COPY . .
 ARG VITE_API_URL
 ENV VITE_API_URL=$VITE_API_URL
